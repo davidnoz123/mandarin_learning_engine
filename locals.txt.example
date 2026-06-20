@@ -1,0 +1,7 @@
+# Copy this file to locals.txt and fill in your paths.
+# locals.txt is gitignored -- never commit it.
+
+AGENT_STANDARDS_DIR=..\nielsoln_agent_standards
+
+# Optional: stable identifier for this machine (defaults to hostname if omitted)
+# MACHINE_ID=laptop

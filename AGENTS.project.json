@@ -1,0 +1,8 @@
+{
+  "standards_repo_raw_base": "https://raw.githubusercontent.com/davidnoz123/nielsoln_agent_standards/0.1",
+  "profiles": [
+    "AGENTS.base",
+    "profiles/python-cli",
+    "profiles/architecture-phased"
+  ]
+}
