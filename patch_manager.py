@@ -1,9 +1,10 @@
 
 """
-Generic rclone-backed patch manager plus Mandarin-specific wrapper.
+Generic rclone-backed patch manager.
 
-Split:
-- PatchManager: generic reusable SQLite/rclone row-patch infrastructure.
+PatchManager: generic reusable SQLite/rclone row-patch infrastructure.
+Contains no domain-specific (e.g. Mandarin) table names or assumptions.
+Subclass and implement rows_export_since() / row_patch_apply() for your schema.
 
 Constraints:
 - No third-party Python dependencies.
@@ -32,6 +33,7 @@ class PatchManager:
     """
 
     PATCH_SCHEMA_VERSION = 1
+    PATCH_MANAGER_VERSION = "0.1"
 
     def __init__(self, db_path, patch_dir, remote_root, machine_id=None, rclone_bin="rclone"):
         import pathlib
@@ -354,6 +356,7 @@ class PatchManager:
     def central_manifest_save_local(self, manifest):
         import json
 
+        self.validate_manifest(manifest)
         manifest["updated_at"] = self.time_now()
         self.central_manifest_path.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True),

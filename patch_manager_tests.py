@@ -2234,5 +2234,136 @@ class TestRepeatedSyncCycles(unittest.TestCase):
         self.assertEqual(diag["local_latest_seq"], diag["manifest_latest_seq"])
 
 
+class TestManifestSaveValidation(unittest.TestCase):
+    """Task 1/2: central_manifest_save_local validates before writing."""
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.remote = LocalRemote(self.root / "remote")
+        self.remote_root = "fake_remote:store"
+        self.pm = TestPatchManager(
+            db_path=self.root / "pm.sqlite",
+            patch_dir=self.root / "patches",
+            remote_root=self.remote_root,
+            machine_id="test_machine",
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _valid_manifest(self):
+        return self.pm.central_manifest_default()
+
+    # --- Task 1: save_local validates before writing ---
+
+    def test_save_valid_manifest_succeeds(self):
+        manifest = self._valid_manifest()
+        self.pm.central_manifest_save_local(manifest)
+        self.assertTrue(self.pm.central_manifest_path.exists())
+
+    def test_save_raises_for_missing_machines(self):
+        manifest = self._valid_manifest()
+        del manifest["machines"]
+        with self.assertRaises(ValueError):
+            self.pm.central_manifest_save_local(manifest)
+
+    def test_file_not_written_when_machines_missing(self):
+        manifest = self._valid_manifest()
+        del manifest["machines"]
+        try:
+            self.pm.central_manifest_save_local(manifest)
+        except ValueError:
+            pass
+        self.assertFalse(self.pm.central_manifest_path.exists())
+
+    def test_save_raises_for_missing_patch_schema_version(self):
+        manifest = self._valid_manifest()
+        del manifest["patch_schema_version"]
+        with self.assertRaises(ValueError):
+            self.pm.central_manifest_save_local(manifest)
+
+    def test_file_not_written_when_schema_version_missing(self):
+        manifest = self._valid_manifest()
+        del manifest["patch_schema_version"]
+        try:
+            self.pm.central_manifest_save_local(manifest)
+        except ValueError:
+            pass
+        self.assertFalse(self.pm.central_manifest_path.exists())
+
+    def test_save_raises_for_missing_remote_root(self):
+        manifest = self._valid_manifest()
+        del manifest["remote_root"]
+        with self.assertRaises(ValueError):
+            self.pm.central_manifest_save_local(manifest)
+
+    def test_save_raises_for_invalid_machine_entry(self):
+        manifest = self._valid_manifest()
+        # Machine entry missing required latest_seq.
+        manifest["machines"]["peer"] = {"updated_at": 1.0}
+        with self.assertRaises(ValueError):
+            self.pm.central_manifest_save_local(manifest)
+
+    def test_file_not_written_for_invalid_machine_entry(self):
+        manifest = self._valid_manifest()
+        manifest["machines"]["peer"] = {"updated_at": 1.0}
+        try:
+            self.pm.central_manifest_save_local(manifest)
+        except ValueError:
+            pass
+        self.assertFalse(self.pm.central_manifest_path.exists())
+
+    def test_save_raises_for_non_dict_machines(self):
+        manifest = self._valid_manifest()
+        manifest["machines"] = "bad"
+        with self.assertRaises(ValueError):
+            self.pm.central_manifest_save_local(manifest)
+
+    def test_existing_file_not_overwritten_when_invalid(self):
+        # Write a valid manifest first, then try to overwrite with invalid.
+        good = self._valid_manifest()
+        self.pm.central_manifest_save_local(good)
+        original_text = self.pm.central_manifest_path.read_text(encoding="utf-8")
+
+        bad = self._valid_manifest()
+        bad["machines"] = "not a dict"
+        try:
+            self.pm.central_manifest_save_local(bad)
+        except ValueError:
+            pass
+        # File must be unchanged.
+        self.assertEqual(self.pm.central_manifest_path.read_text(encoding="utf-8"), original_text)
+
+    # --- Task 2: manifest mutation paths go through save_local ---
+
+    def test_central_manifest_push_rejects_invalid_manifest(self):
+        # Build an invalid manifest and pass it directly to push — must raise.
+        bad = self._valid_manifest()
+        bad["machines"] = "not a dict"
+        with self.assertRaises(ValueError):
+            self.pm.central_manifest_push(bad)
+
+    def test_patch_pack_push_produces_valid_manifest(self):
+        # push() builds its own manifest via pull+mutate+save; it must always
+        # produce a valid manifest and write it without raising.
+        insert_item(self.pm.db_path, "x", "v1", 100.0)
+        result = self.pm.sync_push("test")
+        self.assertTrue(result["ok"])
+        # Manifest on disk must be loadable and valid.
+        loaded = self.pm.central_manifest_load_local()
+        self.assertIn("test_machine", loaded["machines"])
+
+    def test_central_manifest_pull_fallback_writes_valid_manifest(self):
+        # When remote is absent, pull() falls back to default — must be valid.
+        result = self.pm.central_manifest_pull()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["created_default"])
+        loaded = self.pm.central_manifest_load_local()
+        PatchManager.validate_manifest(loaded)  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
