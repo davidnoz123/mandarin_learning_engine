@@ -8,6 +8,9 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+
+# patch_manager is a same-repo sibling module — import at module level is intentional.
+from patch_manager import PatchManager
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -882,134 +885,139 @@ class LearnerSentenceFitScorer:
 
 
 # ---------------------------------------------------------------------------
-# PatchManager
+# MandarinPatchManager
 # ---------------------------------------------------------------------------
 
-@dataclass
-class Patch:
-    patch_id: str
-    machine_id: str
-    created_at: str
-    description: str
-    operations: list[dict]   # list of {"table": ..., "op": "insert"|"update"|"delete", "data": ...}
-    patch_version: str = PATCH_VERSION
-
-
-class PatchManager:
+class MandarinPatchManager(PatchManager):
     """
-    Creates, stores, and applies incremental patches to common_content.sqlite.
-    Patches are immutable JSON files; a manifest tracks what has been applied.
+    Mandarin Learning Engine adapter for the generic PatchManager.
+
+    Syncs five content tables in common_content.sqlite:
+        lexemes, rankings, sentence_candidates, approved_content, analysis.
+
+    Merge policy (Phase 01): INSERT OR IGNORE — safe for append-heavy tables.
+    Timestamp domain: ISO 8601 strings stored as TEXT in SQLite.
+
+    Note: approved_content uses 'approved_at' instead of 'created_at';
+          this is handled via _TABLE_TS_COL.
     """
 
-    def __init__(
-        self,
-        patch_dir: Path = DATA_DIR / "patches",
-        machine_id: Optional[str] = None,
-    ):
-        self.patch_dir = patch_dir
-        self.patch_dir.mkdir(parents=True, exist_ok=True)
-        self.manifest_path = self.patch_dir / "manifest.json"
-        self.machine_id = machine_id or self._load_or_create_machine_id()
-        self._manifest: dict = self._load_manifest()
+    TABLES_CREATED_AT = (
+        "lexemes",
+        "rankings",
+        "sentence_candidates",
+        "approved_content",
+        "analysis",
+    )
 
-    def _load_or_create_machine_id(self) -> str:
-        id_path = self.patch_dir / "machine_id"
-        if id_path.exists():
-            return id_path.read_text().strip()
-        mid = str(uuid.uuid4())
-        id_path.write_text(mid)
-        return mid
+    # Per-table timestamp column override for export queries.
+    # All tables use 'created_at' except approved_content which uses 'approved_at'.
+    _TABLE_TS_COL = {
+        "approved_content": "approved_at",
+    }
 
-    def _load_manifest(self) -> dict:
-        if self.manifest_path.exists():
-            return json.loads(self.manifest_path.read_text())
-        return {"applied": [], "patch_version": PATCH_VERSION}
+    def schema_ensure(self, conn):
+        """Ensure sync_state (via super) and all Mandarin content tables."""
+        super().schema_ensure(conn)
+        conn.executescript(_COMMON_CONTENT_DDL)
+        conn.commit()
 
-    def _save_manifest(self) -> None:
-        self.manifest_path.write_text(
-            json.dumps(self._manifest, indent=2, ensure_ascii=False)
-        )
+    def rows_export_since(self, conn, watermark):
+        watermark_iso = self.iso_from_epoch(watermark)
+        max_ts = watermark_iso
+        tables = {}
 
-    def create_patch(self, description: str, operations: list[dict]) -> Patch:
-        patch = Patch(
-            patch_id=str(uuid.uuid4()),
-            machine_id=self.machine_id,
-            created_at=_now_utc(),
-            description=description,
-            operations=operations,
-        )
-        patch_path = self.patch_dir / f"{patch.patch_id}.json"
-        patch_path.write_text(
-            json.dumps(
-                {
-                    "patch_id":      patch.patch_id,
-                    "machine_id":    patch.machine_id,
-                    "created_at":    patch.created_at,
-                    "description":   patch.description,
-                    "patch_version": patch.patch_version,
-                    "operations":    patch.operations,
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
-        return patch
+        for table in self.TABLES_CREATED_AT:
+            ts_col = self._TABLE_TS_COL.get(table, "created_at")
+            rows = conn.execute(
+                f"SELECT * FROM {table} WHERE {ts_col} > ? ORDER BY {ts_col}, id",
+                (watermark_iso,),
+            ).fetchall()
+            row_dicts = [dict(row) for row in rows]
+            tables[table] = row_dicts
 
-    def apply_patch(self, patch: Patch, conn: sqlite3.Connection) -> None:
-        if patch.patch_id in self._manifest["applied"]:
-            return  # idempotent
+            for row in row_dicts:
+                ts_val = row.get(ts_col)
+                if ts_val and ts_val > max_ts:
+                    max_ts = ts_val
+
+        return {
+            "machine_id": self.machine_id,
+            "exported_at": self.epoch_from_iso(max_ts),
+            "watermark": watermark,
+            "tables": tables,
+        }
+
+    def row_patch_apply(self, conn, patch):
+        if patch.get("schema_version") != self.PATCH_SCHEMA_VERSION:
+            return {
+                "ok": False,
+                "reason": "unsupported_schema_version",
+                "schema_version": patch.get("schema_version"),
+            }
+
+        allowed_tables = set(self.TABLES_CREATED_AT)
+        incoming_tables = set(patch.get("tables", {}).keys())
+        unknown_tables = incoming_tables - allowed_tables
+        if unknown_tables:
+            return {
+                "ok": False,
+                "reason": "unknown_tables",
+                "tables": sorted(unknown_tables),
+            }
+
+        inserted = {}
 
         with conn:
-            for op in patch.operations:
-                table = op["table"]
-                operation = op["op"]
-                data = op["data"]
+            for table, rows in patch.get("tables", {}).items():
+                count = 0
+                for row in rows:
+                    if not row:
+                        continue
+                    columns = list(row.keys())
+                    col_sql = ", ".join(columns)
+                    placeholders = ", ".join("?" for _ in columns)
+                    sql = f"INSERT OR IGNORE INTO {table} ({col_sql}) VALUES ({placeholders})"
+                    cur = conn.execute(sql, [row[col] for col in columns])
+                    count += cur.rowcount
+                inserted[table] = count
 
-                if operation == "insert":
-                    cols = ", ".join(data.keys())
-                    placeholders = ", ".join("?" for _ in data)
-                    conn.execute(
-                        f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})",
-                        list(data.values()),
-                    )
-                elif operation == "update":
-                    updates = ", ".join(f"{k} = ?" for k in data["set"].keys())
-                    where_col = data["where_col"]
-                    where_val = data["where_val"]
-                    conn.execute(
-                        f"UPDATE {table} SET {updates} WHERE {where_col} = ?",
-                        list(data["set"].values()) + [where_val],
-                    )
-                elif operation == "delete":
-                    where_col = data["where_col"]
-                    where_val = data["where_val"]
-                    conn.execute(
-                        f"DELETE FROM {table} WHERE {where_col} = ?",
-                        (where_val,),
-                    )
+        return {"ok": True, "inserted": inserted}
 
-        self._manifest["applied"].append(patch.patch_id)
-        self._save_manifest()
+    @classmethod
+    def iso_from_epoch(cls, epoch_value):
+        from datetime import datetime, timezone
 
-    def load_patch(self, patch_id: str) -> Patch:
-        patch_path = self.patch_dir / f"{patch_id}.json"
-        data = json.loads(patch_path.read_text())
-        return Patch(
-            patch_id=data["patch_id"],
-            machine_id=data["machine_id"],
-            created_at=data["created_at"],
-            description=data["description"],
-            operations=data["operations"],
-            patch_version=data["patch_version"],
-        )
+        try:
+            epoch_float = float(epoch_value)
+        except Exception:
+            epoch_float = 0.0
 
-    def list_unapplied(self) -> list[str]:
-        applied = set(self._manifest["applied"])
-        all_patches = [
-            p.stem for p in self.patch_dir.glob("*.json")
-            if p.stem not in ("manifest",)
-        ]
-        return [pid for pid in all_patches if pid not in applied]
+        if epoch_float <= 0.0:
+            return "0000-01-01T00:00:00+00:00"
+
+        return datetime.fromtimestamp(epoch_float, tz=timezone.utc).isoformat()
+
+    @classmethod
+    def epoch_from_iso(cls, iso_value):
+        from datetime import datetime, timezone
+
+        if not iso_value:
+            return 0.0
+        if iso_value == "0000-01-01T00:00:00+00:00":
+            return 0.0
+
+        text = str(iso_value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return float(dt.timestamp())
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1033,8 @@ class MandarinLearningEngine:
         self,
         data_dir: Path = DATA_DIR,
         learner_id: str = "default",
+        patch_remote_root: str = "",
+        patch_machine_id: Optional[str] = None,
     ):
         global DATA_DIR, GENERATION_CACHE_DB, COMMON_CONTENT_DB
         DATA_DIR = data_dir
@@ -1037,7 +1047,12 @@ class MandarinLearningEngine:
         self.sentence_analyzer = SentenceAnalyzer(COMMON_CONTENT_DB)
         self.learner = LearnerModel(learner_id)
         self.fit_scorer = LearnerSentenceFitScorer(self.learner, self.lexeme_repo)
-        self.patch_manager = PatchManager(data_dir / "patches")
+        self.patch_manager = MandarinPatchManager(
+            db_path=COMMON_CONTENT_DB,
+            patch_dir=data_dir / "patches",
+            remote_root=patch_remote_root,
+            machine_id=patch_machine_id,
+        )
 
     def status(self) -> dict:
         lexeme_count = self.lexeme_repo.conn.execute(

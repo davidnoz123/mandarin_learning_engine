@@ -55,4 +55,13 @@ As phases grow, sub-modules will be extracted and listed here.
 ## No sibling-repo dependencies in Phase 01
 
 This repo has no `versholn` or cross-repo dependencies in Phase 01.
-All imports are stdlib only at module level.
+
+Module-level imports in source files must be stdlib only, with one exception:
+`patch_manager` is a same-repo sibling module and may be imported at module level
+inside `mandarin_learning_engine.py`:
+
+```python
+from patch_manager import PatchManager
+```
+
+All other non-stdlib, non-same-repo imports must use the `safe_local_imports` pattern.
