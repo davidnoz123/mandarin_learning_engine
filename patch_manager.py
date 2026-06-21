@@ -150,7 +150,10 @@ class PatchManager:
                 patch["schema_version"] = self.PATCH_SCHEMA_VERSION
                 patch["machine_id"] = self.machine_id
                 patch["description"] = description
-                patch["exported_at"] = patch.get("exported_at") or self.time_now()
+                # Use explicit None check — 0.0 is a valid exported_at (start-of-epoch
+                # watermark) and must not be treated as "missing" by the 'or' operator.
+                if patch.get("exported_at") is None:
+                    patch["exported_at"] = self.time_now()
 
                 seq = self.local_patch_seq_next()
                 patch["seq"] = f"{seq:06d}"
