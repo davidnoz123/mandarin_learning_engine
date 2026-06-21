@@ -575,9 +575,18 @@ class PatchManagerChaosTests(unittest.TestCase):
         insert_item(a.db_path, "one", "v1", 100.0)
         self.assertTrue(a.sync_push("a")["ok"])
 
-        self.remote.fail_next_copyto = "corrupt_download"
-        with self.assertRaises(Exception):
-            b.sync_pull()
+        # Directly corrupt the remote patch bytes (not the manifest) so that
+        # patch_pack_apply returns a structured error and sync_pull continues.
+        remote_patch = (
+            self.remote.storage_dir / "patch_store" / "machines" / "machine_a"
+            / "patch-000001.json.gz"
+        )
+        remote_patch.write_bytes(b"\x00 this is not gzip")
+
+        result = b.sync_pull()
+        self.assertTrue(result["ok"])
+        machine_result = result["per_machine"].get("machine_a", {})
+        self.assertIn(machine_result.get("stopped_reason"), ("apply_failed", "download_failed"))
 
         conn = b.conn_open()
         try:
@@ -592,9 +601,18 @@ class PatchManagerChaosTests(unittest.TestCase):
         insert_item(a.db_path, "one", "v1", 100.0)
         self.assertTrue(a.sync_push("a")["ok"])
 
-        self.remote.fail_next_copyto = "truncate_download"
-        with self.assertRaises(Exception):
-            b.sync_pull()
+        # Truncate the remote patch file to corrupt gzip structure.
+        remote_patch = (
+            self.remote.storage_dir / "patch_store" / "machines" / "machine_a"
+            / "patch-000001.json.gz"
+        )
+        data = remote_patch.read_bytes()
+        remote_patch.write_bytes(data[: max(1, len(data) // 2)])
+
+        result = b.sync_pull()
+        self.assertTrue(result["ok"])
+        machine_result = result["per_machine"].get("machine_a", {})
+        self.assertIn(machine_result.get("stopped_reason"), ("apply_failed", "download_failed"))
 
         conn = b.conn_open()
         try:
@@ -658,6 +676,22 @@ def _write_gz_patch(path, patch_dict):
     _write_gz(path, json.dumps(patch_dict, ensure_ascii=False).encode("utf-8"))
 
 
+def _write_gz_patch_with_hash(path, patch_dict):
+    """Write a patch with a correct patch_hash field (mirrors patch_pack_create logic)."""
+    import hashlib
+    payload_no_hash = {k: v for k, v in patch_dict.items() if k != "patch_hash"}
+    payload_bytes = json.dumps(payload_no_hash, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    full = {**payload_no_hash, "patch_hash": hashlib.sha256(payload_bytes).hexdigest()}
+    _write_gz(path, json.dumps(full, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    return full["patch_hash"]
+
+
+def _write_tampered_patch(path, patch_dict):
+    """Write a patch whose patch_hash is deliberately wrong."""
+    full = {**patch_dict, "patch_hash": "0" * 64}
+    _write_gz(path, json.dumps(full, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+
 # ---------------------------------------------------------------------------
 # 1. Malformed gzip does not advance sync_state
 # ---------------------------------------------------------------------------
@@ -697,49 +731,55 @@ class TestMalformedGzip(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_raises_on_random_garbage(self):
+    def test_corrupt_gzip_returns_not_ok(self):
+        # Previously raised; now returns structured {ok: False} so pull can continue.
         p = self._peer_patch_path("peer_b", 1)
         p.write_bytes(b"\x00\x01\x02\x03 this is not gzip")
-        with self.assertRaises(Exception):
-            self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertFalse(result["ok"])
+
+    def test_corrupt_gzip_reason_field(self):
+        p = self._peer_patch_path("peer_b", 1)
+        p.write_bytes(b"\x00\x01\x02\x03 this is not gzip")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertEqual(result["reason"], "corrupt_gzip")
 
     def test_sync_state_not_advanced_after_garbage(self):
         p = self._peer_patch_path("peer_b", 1)
         p.write_bytes(b"\xff\xfe garbage bytes")
-        try:
-            self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
-        except Exception:
-            pass
+        self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
         self.assertEqual(self._state("patch_applied_peer_b"), "000000")
 
-    def test_raises_on_valid_gzip_but_invalid_json(self):
+    def test_invalid_json_in_gzip_returns_not_ok(self):
+        # Valid gzip but JSON parse fails.
         p = self._peer_patch_path("peer_c", 1)
         _write_gz(p, b"this is valid gzip but not json {{{")
-        with self.assertRaises(Exception):
-            self.pm.patch_pack_apply(p, source_machine_id="peer_c", seq="000001")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_c", seq="000001")
+        self.assertFalse(result["ok"])
+
+    def test_invalid_json_reason_field(self):
+        p = self._peer_patch_path("peer_c", 1)
+        _write_gz(p, b"not json")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_c", seq="000001")
+        self.assertEqual(result["reason"], "corrupt_patch_json")
 
     def test_sync_state_not_advanced_after_invalid_json_gzip(self):
         p = self._peer_patch_path("peer_c", 1)
         _write_gz(p, b"not json")
-        try:
-            self.pm.patch_pack_apply(p, source_machine_id="peer_c", seq="000001")
-        except Exception:
-            pass
+        self.pm.patch_pack_apply(p, source_machine_id="peer_c", seq="000001")
         self.assertEqual(self._state("patch_applied_peer_c"), "000000")
 
-    def test_raises_on_empty_file(self):
+    def test_empty_file_returns_not_ok(self):
+        # Previously raised; now returns structured error.
         p = self._peer_patch_path("peer_d", 1)
         p.write_bytes(b"")
-        with self.assertRaises(Exception):
-            self.pm.patch_pack_apply(p, source_machine_id="peer_d", seq="000001")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_d", seq="000001")
+        self.assertFalse(result["ok"])
 
     def test_sync_state_not_advanced_after_empty_file(self):
         p = self._peer_patch_path("peer_d", 1)
         p.write_bytes(b"")
-        try:
-            self.pm.patch_pack_apply(p, source_machine_id="peer_d", seq="000001")
-        except Exception:
-            pass
+        self.pm.patch_pack_apply(p, source_machine_id="peer_d", seq="000001")
         self.assertEqual(self._state("patch_applied_peer_d"), "000000")
 
 
@@ -1008,7 +1048,7 @@ class TestCorruptCentralManifest(unittest.TestCase):
     def test_save_load_roundtrip_of_valid_manifest_not_affected(self):
         # Sanity check: valid manifest save/load still works after the above.
         manifest = self.pm.central_manifest_default()
-        manifest["machines"]["peer_x"] = {"latest_seq": "000001"}
+        manifest["machines"]["peer_x"] = {"latest_seq": "000001", "updated_at": 1.0}
         self.pm.central_manifest_save_local(manifest)
         loaded = self.pm.central_manifest_load_local()
         self.assertIn("peer_x", loaded["machines"])
@@ -1382,6 +1422,816 @@ class TestMachineIdCollision(unittest.TestCase):
 
         self.assertIn("b1", read_items(a.db_path))
         self.assertIn("a1", read_items(b.db_path))
+
+
+# ---------------------------------------------------------------------------
+# Task 1+3 — Patch integrity (hash) and structured corruption errors
+# ---------------------------------------------------------------------------
+
+class TestPatchIntegrity(unittest.TestCase):
+    """
+    patch_pack_create must embed a SHA-256 patch_hash covering all payload
+    fields (excluding patch_hash itself, using canonical sort_keys JSON).
+
+    patch_pack_apply must:
+    - validate the hash when present; return {"ok": False, "reason": "invalid_patch_hash"}
+      on mismatch without touching the DB or advancing sync_state.
+    - silently skip hash validation for legacy patches that omit patch_hash.
+    - return {"ok": False, "reason": "corrupt_gzip"} / "corrupt_patch_json" for
+      unreadable files instead of raising an exception.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        self.remote = LocalRemote(self.root / "remote")
+        self.pm = TestPatchManager(
+            db_path=self.root / "test.sqlite",
+            patch_dir=self.root / "patches",
+            remote_root="fake_remote:/store",
+            machine_id="machine_a",
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _read_patch_dict(self, patch_file):
+        with gzip.open(patch_file, "rb") as fh:
+            return json.loads(fh.read().decode("utf-8"))
+
+    def _peer_path(self, peer_id, seq=1):
+        p = self.root / "patches" / "machines" / peer_id / f"patch-{seq:06d}.json.gz"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _state(self, key):
+        conn = self.pm.conn_open()
+        try:
+            return self.pm.sync_state_get(conn, key, "000000")
+        finally:
+            conn.close()
+
+    def _row_count(self):
+        conn = self.pm.conn_open()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _minimal_patch(self, peer_id="peer_b", seq=1, rows=None):
+        return {
+            "schema_version": PatchManager.PATCH_SCHEMA_VERSION,
+            "machine_id": peer_id,
+            "seq": f"{seq:06d}",
+            "exported_at": 100.0,
+            "watermark": 0.0,
+            "description": "test",
+            "tables": {"items": rows or []},
+        }
+
+    # --- Hash present in created patches ---
+
+    def test_created_patch_has_patch_hash(self):
+        result = self.pm.patch_pack_create()
+        data = self._read_patch_dict(result["patch_file"])
+        self.assertIn("patch_hash", data)
+
+    def test_patch_hash_is_64_hex_chars(self):
+        result = self.pm.patch_pack_create()
+        data = self._read_patch_dict(result["patch_file"])
+        h = data["patch_hash"]
+        self.assertEqual(len(h), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in h), f"Not hex: {h}")
+
+    def test_hash_changes_when_description_changes(self):
+        # Same data, different description — different hash.
+        import hashlib
+        p1 = self._minimal_patch(peer_id="peer_b", rows=[])
+        p2 = dict(p1, description="different")
+        b1 = json.dumps(p1, ensure_ascii=False, sort_keys=True).encode()
+        b2 = json.dumps(p2, ensure_ascii=False, sort_keys=True).encode()
+        self.assertNotEqual(hashlib.sha256(b1).hexdigest(), hashlib.sha256(b2).hexdigest())
+
+    # --- Hash validates correctly on apply ---
+
+    def test_created_patch_applies_ok(self):
+        insert_item(self.pm.db_path, "x1", "v1", 100.0)
+        result = self.pm.patch_pack_create()
+        # Apply on a peer manager that has the same schema but different machine_id.
+        peer = TestPatchManager(
+            db_path=self.root / "peer.sqlite",
+            patch_dir=self.root / "peer_patches",
+            remote_root="fake_remote:/store",
+            machine_id="peer_b",
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+        apply_result = peer.patch_pack_apply(
+            result["patch_file"],
+            source_machine_id="machine_a",
+            seq=result["seq"],
+        )
+        self.assertTrue(apply_result["ok"], apply_result)
+
+    def test_manually_hashed_patch_applies_ok(self):
+        p = self._peer_path("peer_b")
+        base = self._minimal_patch(rows=[{"id": "r1", "value": "hello", "updated_at": 100.0}])
+        _write_gz_patch_with_hash(p, base)
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertTrue(result["ok"], result)
+
+    def test_manually_hashed_patch_writes_rows(self):
+        p = self._peer_path("peer_b")
+        rows = [{"id": "r1", "value": "hello", "updated_at": 100.0}]
+        _write_gz_patch_with_hash(p, self._minimal_patch(rows=rows))
+        self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertEqual(self._row_count(), 1)
+
+    # --- Tampered hash detected ---
+
+    def test_tampered_patch_returns_not_ok(self):
+        p = self._peer_path("peer_b")
+        _write_tampered_patch(p, self._minimal_patch())
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertFalse(result["ok"])
+
+    def test_tampered_patch_reason_is_invalid_patch_hash(self):
+        p = self._peer_path("peer_b")
+        _write_tampered_patch(p, self._minimal_patch())
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertEqual(result["reason"], "invalid_patch_hash")
+
+    def test_tampered_patch_result_contains_hash_fields(self):
+        p = self._peer_path("peer_b")
+        _write_tampered_patch(p, self._minimal_patch())
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertIn("stored_hash", result)
+        self.assertIn("computed_hash", result)
+
+    def test_tampered_patch_sync_state_not_advanced(self):
+        p = self._peer_path("peer_b")
+        _write_tampered_patch(p, self._minimal_patch())
+        self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertEqual(self._state("patch_applied_peer_b"), "000000")
+
+    def test_tampered_patch_rows_not_written(self):
+        rows = [{"id": "r1", "value": "should_not_appear", "updated_at": 100.0}]
+        p = self._peer_path("peer_b")
+        _write_tampered_patch(p, self._minimal_patch(rows=rows))
+        self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertEqual(self._row_count(), 0)
+
+    def test_tampered_retry_possible_after_failure(self):
+        # Failed tampered apply does not block a subsequent correct apply.
+        p = self._peer_path("peer_b")
+        _write_tampered_patch(p, self._minimal_patch())
+        self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+
+        rows = [{"id": "y1", "value": "valid", "updated_at": 200.0}]
+        _write_gz_patch_with_hash(p, self._minimal_patch(rows=rows))
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertTrue(result["ok"])
+        self.assertEqual(self._row_count(), 1)
+
+    # --- Legacy patches without hash ---
+
+    def test_legacy_patch_without_hash_applies_ok(self):
+        p = self._peer_path("peer_b")
+        rows = [{"id": "leg1", "value": "legacy", "updated_at": 50.0}]
+        _write_gz_patch(p, self._minimal_patch(rows=rows))   # no patch_hash field
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertTrue(result["ok"], result)
+
+    def test_legacy_patch_rows_written(self):
+        p = self._peer_path("peer_b")
+        rows = [{"id": "leg1", "value": "legacy", "updated_at": 50.0}]
+        _write_gz_patch(p, self._minimal_patch(rows=rows))
+        self.pm.patch_pack_apply(p, source_machine_id="peer_b", seq="000001")
+        self.assertEqual(self._row_count(), 1)
+
+    # --- Structured errors for corrupt data (Task 3) ---
+
+    def test_corrupt_gzip_returns_structured_error(self):
+        p = self._peer_path("peer_c")
+        p.write_bytes(b"\xde\xad\xbe\xef not gzip")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_c", seq="000001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "corrupt_gzip")
+
+    def test_corrupt_json_in_gzip_returns_structured_error(self):
+        p = self._peer_path("peer_d")
+        _write_gz(p, b"{ invalid json !!!!")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_d", seq="000001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "corrupt_patch_json")
+
+    def test_structured_error_has_detail_field(self):
+        p = self._peer_path("peer_e")
+        p.write_bytes(b"garbage")
+        result = self.pm.patch_pack_apply(p, source_machine_id="peer_e", seq="000001")
+        self.assertIn("detail", result)
+
+    def test_pull_continues_when_hash_tampered(self):
+        # Even with a tampered patch, patch_pack_pull must continue other machines.
+        good_peer = TestPatchManager(
+            db_path=self.root / "good.sqlite",
+            patch_dir=self.root / "good_patches",
+            remote_root="fake_remote:/store",
+            machine_id="peer_good",
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+        insert_item(good_peer.db_path, "g1", "from_good", 300.0)
+        self.assertTrue(good_peer.sync_push("good")["ok"])
+
+        # Place a tampered patch for peer_bad in the remote
+        bad_dir = self.remote.storage_dir / "store" / "machines" / "peer_bad"
+        bad_dir.mkdir(parents=True, exist_ok=True)
+        _write_tampered_patch(bad_dir / "patch-000001.json.gz", self._minimal_patch(peer_id="peer_bad"))
+
+        # Inject peer_bad into the manifest
+        manifest_path = self.remote.storage_dir / "store" / "central_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["machines"]["peer_bad"] = {"latest_seq": "000001", "updated_at": 1.0}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        result = self.pm.sync_pull()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["per_machine"]["peer_bad"]["stopped_reason"], "apply_failed")
+        self.assertEqual(result["per_machine"]["peer_good"]["applied"], 1)
+
+
+# ---------------------------------------------------------------------------
+# Task 2 — Manifest validation
+# ---------------------------------------------------------------------------
+
+class TestManifestValidation(unittest.TestCase):
+    """
+    PatchManager.validate_manifest raises ValueError with descriptive messages
+    for any structural violation.  No silent repair or fallback.
+    """
+
+    def _valid(self):
+        return {
+            "patch_schema_version": PatchManager.PATCH_SCHEMA_VERSION,
+            "remote_root": "gdrive:test",
+            "machines": {},
+            "updated_at": 1_000_000.0,
+        }
+
+    def _valid_with_machine(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "000001", "updated_at": 1_000_000.0}
+        return m
+
+    # --- Valid manifests pass ---
+
+    def test_valid_empty_machines_passes(self):
+        PatchManager.validate_manifest(self._valid())   # must not raise
+
+    def test_valid_with_machine_entry_passes(self):
+        PatchManager.validate_manifest(self._valid_with_machine())
+
+    def test_default_manifest_passes(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            remote = LocalRemote(pathlib.Path(tmp.name) / "r")
+            pm = TestPatchManager(
+                db_path=pathlib.Path(tmp.name) / "t.sqlite",
+                patch_dir=pathlib.Path(tmp.name) / "patches",
+                remote_root="fake_remote:/s",
+                machine_id="machine_a",
+                rclone_bin="fake-rclone",
+                remote=remote,
+            )
+            PatchManager.validate_manifest(pm.central_manifest_default())
+        finally:
+            tmp.cleanup()
+
+    # --- Missing top-level fields ---
+
+    def test_missing_patch_schema_version_raises(self):
+        m = self._valid()
+        del m["patch_schema_version"]
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_missing_remote_root_raises(self):
+        m = self._valid()
+        del m["remote_root"]
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_missing_machines_raises(self):
+        m = self._valid()
+        del m["machines"]
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_missing_updated_at_raises(self):
+        m = self._valid()
+        del m["updated_at"]
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    # --- Invalid types ---
+
+    def test_schema_version_not_int_raises(self):
+        m = self._valid()
+        m["patch_schema_version"] = "1"
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_schema_version_float_raises(self):
+        m = self._valid()
+        m["patch_schema_version"] = 1.0
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_remote_root_not_string_raises(self):
+        m = self._valid()
+        m["remote_root"] = 42
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_remote_root_empty_string_raises(self):
+        m = self._valid()
+        m["remote_root"] = ""
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_remote_root_whitespace_only_raises(self):
+        m = self._valid()
+        m["remote_root"] = "   "
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machines_not_dict_raises(self):
+        m = self._valid()
+        m["machines"] = []
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_not_a_dict_raises(self):
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest("not a dict")
+
+    # --- Invalid machine entries ---
+
+    def test_machine_entry_not_dict_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = "bad"
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_missing_latest_seq_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"updated_at": 1.0}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_missing_updated_at_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "000001"}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_seq_wrong_length_5_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "00001", "updated_at": 1.0}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_seq_wrong_length_7_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "0000001", "updated_at": 1.0}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_seq_contains_letters_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "00000a", "updated_at": 1.0}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_seq_not_string_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": 1, "updated_at": 1.0}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_updated_at_string_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "000001", "updated_at": "now"}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_updated_at_none_raises(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "000001", "updated_at": None}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    def test_machine_entry_updated_at_int_ok(self):
+        # int is acceptable for updated_at (isinstance check covers int and float)
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "000001", "updated_at": 1}
+        PatchManager.validate_manifest(m)   # must not raise
+
+    def test_multiple_machines_all_validated(self):
+        m = self._valid()
+        m["machines"]["machine_a"] = {"latest_seq": "000001", "updated_at": 1.0}
+        m["machines"]["machine_b"] = {"latest_seq": "bad!!!", "updated_at": 1.0}
+        with self.assertRaises(ValueError):
+            PatchManager.validate_manifest(m)
+
+    # --- Integration: load_local validates ---
+
+    def test_load_local_raises_on_invalid_structure(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            remote = LocalRemote(pathlib.Path(tmp.name) / "r")
+            pm = TestPatchManager(
+                db_path=pathlib.Path(tmp.name) / "t.sqlite",
+                patch_dir=pathlib.Path(tmp.name) / "patches",
+                remote_root="fake_remote:/s",
+                machine_id="machine_a",
+                rclone_bin="fake-rclone",
+                remote=remote,
+            )
+            # Write a manifest with valid JSON but missing required field.
+            bad = {"machines": {}, "updated_at": 1.0}   # missing patch_schema_version + remote_root
+            pm.central_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            pm.central_manifest_path.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                pm.central_manifest_load_local()
+        finally:
+            tmp.cleanup()
+
+    def test_load_local_returns_default_when_file_missing(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            remote = LocalRemote(pathlib.Path(tmp.name) / "r")
+            pm = TestPatchManager(
+                db_path=pathlib.Path(tmp.name) / "t.sqlite",
+                patch_dir=pathlib.Path(tmp.name) / "patches",
+                remote_root="fake_remote:/s",
+                machine_id="machine_a",
+                rclone_bin="fake-rclone",
+                remote=remote,
+            )
+            manifest = pm.central_manifest_load_local()   # file doesn't exist
+            self.assertIn("machines", manifest)
+        finally:
+            tmp.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — Machine ID diagnostics
+# ---------------------------------------------------------------------------
+
+class TestMachineIdDiagnostics(unittest.TestCase):
+    """
+    machine_id_diagnostics() returns a dict describing local machine state and
+    potential collision risk.  Collision risk is flagged when the central
+    manifest's latest_seq for this machine_id is ahead of the locally-held
+    patch files — indicating another installation is uploading under the same ID.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        self.remote = LocalRemote(self.root / "remote")
+        self.remote_root = "fake_remote:/store"
+
+    def tearDown(self):
+        os.environ.pop("MACHINE_ID", None)
+        self._tmp.cleanup()
+
+    def _make_pm(self, name, machine_id):
+        return TestPatchManager(
+            db_path=self.root / f"{name}.sqlite",
+            patch_dir=self.root / f"{name}_patches",
+            remote_root=self.remote_root,
+            machine_id=machine_id,
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+
+    def _make_pm_autoid(self, name):
+        """Create a manager without an explicit machine_id so machine_id_get() runs
+        and writes machine_id.txt to disk."""
+        return TestPatchManager(
+            db_path=self.root / f"{name}.sqlite",
+            patch_dir=self.root / f"{name}_patches",
+            remote_root=self.remote_root,
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+
+    # --- Required keys ---
+
+    def test_returns_dict(self):
+        pm = self._make_pm("a", "machine_a")
+        self.assertIsInstance(pm.machine_id_diagnostics(), dict)
+
+    def test_includes_all_required_keys(self):
+        pm = self._make_pm("a", "machine_a")
+        diag = pm.machine_id_diagnostics()
+        for key in ("machine_id", "source", "id_file_path", "id_file_exists",
+                    "local_latest_seq", "manifest_latest_seq",
+                    "collision_risk", "collision_risk_reason"):
+            self.assertIn(key, diag, f"Missing key: {key}")
+
+    def test_machine_id_matches(self):
+        pm = self._make_pm("a", "machine_a")
+        self.assertEqual(pm.machine_id_diagnostics()["machine_id"], "machine_a")
+
+    # --- Source detection ---
+
+    def test_source_is_file_when_file_exists(self):
+        # Use auto-id so machine_id_get() runs and writes machine_id.txt.
+        pm = self._make_pm_autoid("a")
+        self.assertEqual(pm.machine_id_diagnostics()["source"], "file")
+
+    def test_source_is_env_when_only_env_set(self):
+        os.environ["MACHINE_ID"] = "env-machine"
+        patch_dir = self.root / "env_patches"
+        patch_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure no machine_id.txt exists
+        id_file = patch_dir / "machine_id.txt"
+        if id_file.exists():
+            id_file.unlink()
+        pm = TestPatchManager(
+            db_path=self.root / "env.sqlite",
+            patch_dir=patch_dir,
+            remote_root=self.remote_root,
+            machine_id="env-machine",
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+        # Remove file written by constructor so source detection sees env
+        id_file.unlink(missing_ok=True)
+        self.assertEqual(pm.machine_id_diagnostics()["source"], "env")
+
+    def test_source_is_generated_when_neither(self):
+        os.environ.pop("MACHINE_ID", None)
+        patch_dir = self.root / "gen_patches"
+        patch_dir.mkdir(parents=True, exist_ok=True)
+        pm = TestPatchManager(
+            db_path=self.root / "gen.sqlite",
+            patch_dir=patch_dir,
+            remote_root=self.remote_root,
+            machine_id="some-id",
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+        id_file = patch_dir / "machine_id.txt"
+        id_file.unlink(missing_ok=True)
+        self.assertEqual(pm.machine_id_diagnostics()["source"], "generated")
+
+    # --- Seq tracking ---
+
+    def test_local_latest_seq_zero_when_no_patches(self):
+        pm = self._make_pm("a", "machine_a")
+        self.assertEqual(pm.machine_id_diagnostics()["local_latest_seq"], "000000")
+
+    def test_local_latest_seq_after_create(self):
+        pm = self._make_pm("a", "machine_a")
+        pm.patch_pack_create()
+        self.assertEqual(pm.machine_id_diagnostics()["local_latest_seq"], "000001")
+
+    def test_local_latest_seq_after_multiple_creates(self):
+        pm = self._make_pm("a", "machine_a")
+        for _ in range(3):
+            pm.patch_pack_create()
+        self.assertEqual(pm.machine_id_diagnostics()["local_latest_seq"], "000003")
+
+    # --- Manifest / collision risk ---
+
+    def test_manifest_latest_seq_none_when_no_manifest(self):
+        pm = self._make_pm("a", "machine_a")
+        self.assertIsNone(pm.machine_id_diagnostics()["manifest_latest_seq"])
+
+    def test_no_collision_risk_when_no_manifest(self):
+        pm = self._make_pm("a", "machine_a")
+        self.assertFalse(pm.machine_id_diagnostics()["collision_risk"])
+
+    def test_no_collision_risk_after_normal_push(self):
+        pm = self._make_pm("a", "machine_a")
+        insert_item(pm.db_path, "x", "v", 100.0)
+        pm.sync_push("normal")
+        diag = pm.machine_id_diagnostics()
+        self.assertFalse(diag["collision_risk"], diag)
+
+    def test_collision_risk_when_manifest_ahead_of_local(self):
+        pm = self._make_pm("a", "machine_a")
+        # Write a manifest claiming seq=000003 but local has no patches.
+        manifest = {
+            "patch_schema_version": PatchManager.PATCH_SCHEMA_VERSION,
+            "remote_root": self.remote_root,
+            "machines": {"machine_a": {"latest_seq": "000003", "updated_at": 1.0}},
+            "updated_at": 1.0,
+        }
+        pm.central_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        pm.central_manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        diag = pm.machine_id_diagnostics()
+        self.assertTrue(diag["collision_risk"])
+
+    def test_collision_risk_reason_is_manifest_seq_ahead(self):
+        pm = self._make_pm("a", "machine_a")
+        manifest = {
+            "patch_schema_version": PatchManager.PATCH_SCHEMA_VERSION,
+            "remote_root": self.remote_root,
+            "machines": {"machine_a": {"latest_seq": "000005", "updated_at": 1.0}},
+            "updated_at": 1.0,
+        }
+        pm.central_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        pm.central_manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        diag = pm.machine_id_diagnostics()
+        self.assertEqual(diag["collision_risk_reason"], "manifest_seq_ahead_of_local")
+
+    def test_no_collision_when_manifest_matches_local(self):
+        pm = self._make_pm("a", "machine_a")
+        pm.patch_pack_create()
+        manifest = {
+            "patch_schema_version": PatchManager.PATCH_SCHEMA_VERSION,
+            "remote_root": self.remote_root,
+            "machines": {"machine_a": {"latest_seq": "000001", "updated_at": 1.0}},
+            "updated_at": 1.0,
+        }
+        pm.central_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        pm.central_manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertFalse(pm.machine_id_diagnostics()["collision_risk"])
+
+    def test_collision_risk_false_when_local_ahead_of_manifest(self):
+        # We have more local patches than manifest knows about — not a collision.
+        pm = self._make_pm("a", "machine_a")
+        for _ in range(3):
+            pm.patch_pack_create()
+        manifest = {
+            "patch_schema_version": PatchManager.PATCH_SCHEMA_VERSION,
+            "remote_root": self.remote_root,
+            "machines": {"machine_a": {"latest_seq": "000001", "updated_at": 1.0}},
+            "updated_at": 1.0,
+        }
+        pm.central_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        pm.central_manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertFalse(pm.machine_id_diagnostics()["collision_risk"])
+
+    def test_id_file_exists_true_after_init(self):
+        # Use auto-id so machine_id_get() runs and writes machine_id.txt.
+        pm = self._make_pm_autoid("a")
+        self.assertTrue(pm.machine_id_diagnostics()["id_file_exists"])
+
+    def test_id_file_path_ends_with_machine_id_txt(self):
+        pm = self._make_pm("a", "machine_a")
+        path = pm.machine_id_diagnostics()["id_file_path"]
+        self.assertTrue(path.endswith("machine_id.txt"), path)
+
+    def test_corrupt_manifest_does_not_crash_diagnostics(self):
+        pm = self._make_pm("a", "machine_a")
+        pm.central_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        pm.central_manifest_path.write_bytes(b"{ invalid json !!!")
+        # Should not raise — corrupt manifest is silently handled in diagnostics.
+        diag = pm.machine_id_diagnostics()
+        self.assertFalse(diag["collision_risk"])
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — Repeated sync cycles and recovery
+# ---------------------------------------------------------------------------
+
+class TestRepeatedSyncCycles(unittest.TestCase):
+    """
+    End-to-end tests covering multiple push/pull rounds and recovery scenarios.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        self.remote = LocalRemote(self.root / "remote")
+        self.remote_root = "fake_remote:/store"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _manager(self, name, machine_id):
+        return TestPatchManager(
+            db_path=self.root / f"{name}.sqlite",
+            patch_dir=self.root / f"{name}_patches",
+            remote_root=self.remote_root,
+            machine_id=machine_id,
+            rclone_bin="fake-rclone",
+            remote=self.remote,
+        )
+
+    def test_five_push_cycles_accumulate_five_patch_files(self):
+        pm = self._manager("a", "machine_a")
+        for i in range(5):
+            insert_item(pm.db_path, f"item_{i}", "v", float(i + 1))
+            pm.sync_push(f"round {i}")
+        patches = sorted((self.root / "a_patches" / "machines" / "machine_a").glob("patch-*.json.gz"))
+        self.assertEqual(len(patches), 5)
+
+    def test_pull_after_multiple_pushes_applies_all_in_order(self):
+        a = self._manager("a", "machine_a")
+        b = self._manager("b", "machine_b")
+
+        for i in range(4):
+            insert_item(a.db_path, f"item_{i}", f"v{i}", float(i + 1) * 100)
+            a.sync_push(f"push {i}")
+
+        result = b.sync_pull()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["per_machine"]["machine_a"]["applied"], 4)
+
+        b_items = read_items(b.db_path)
+        for i in range(4):
+            self.assertIn(f"item_{i}", b_items)
+
+    def test_incremental_pull_resumes_from_correct_seq(self):
+        a = self._manager("a", "machine_a")
+        b = self._manager("b", "machine_b")
+
+        # Push 3 patches from a, pull 3 into b.
+        for i in range(3):
+            insert_item(a.db_path, f"item_{i}", "v", float(i + 1))
+            a.sync_push(f"round {i}")
+        b.sync_pull()
+
+        # Push 2 more; second pull should apply exactly those 2.
+        for i in range(3, 5):
+            insert_item(a.db_path, f"item_{i}", "v", float(i + 1))
+            a.sync_push(f"round {i}")
+
+        result = b.sync_pull()
+        self.assertEqual(result["per_machine"]["machine_a"]["applied"], 2)
+
+    def test_recovery_after_apply_failed_retries_next_pull(self):
+        a = self._manager("a", "machine_a")
+        b = self._manager("b", "machine_b")
+
+        insert_item(a.db_path, "item_0", "v0", 100.0)
+        a.sync_push("push 0")
+
+        # Directly corrupt the remote patch so the first pull fails at apply,
+        # not at the manifest download.
+        remote_patch = (
+            self.remote.storage_dir / "store" / "machines" / "machine_a"
+            / "patch-000001.json.gz"
+        )
+        original_bytes = remote_patch.read_bytes()
+        remote_patch.write_bytes(b"\x00 not gzip")
+
+        result1 = b.sync_pull()
+        self.assertTrue(result1["ok"])
+        self.assertIn(result1["per_machine"]["machine_a"].get("stopped_reason"),
+                      ("apply_failed", "download_failed"))
+
+        # Restore the patch file and retry — second pull must succeed.
+        remote_patch.write_bytes(original_bytes)
+
+        result2 = b.sync_pull()
+        self.assertTrue(result2["ok"])
+        self.assertEqual(result2["per_machine"]["machine_a"]["applied"], 1)
+        self.assertIn("item_0", read_items(b.db_path))
+
+    def test_sync_all_round_trip_two_machines(self):
+        a = self._manager("a", "machine_a")
+        b = self._manager("b", "machine_b")
+
+        insert_item(a.db_path, "a1", "from_a", 100.0)
+        insert_item(b.db_path, "b1", "from_b", 200.0)
+
+        a.sync_all("a round 1")
+        b.sync_all("b round 1")
+        a.sync_all("a round 2")   # pull b's data
+
+        self.assertIn("b1", read_items(a.db_path))
+        self.assertIn("a1", read_items(b.db_path))
+
+    def test_empty_push_then_row_push_exports_rows_correctly(self):
+        # An initial push with no rows must not swallow future rows.
+        a = self._manager("a", "machine_a")
+        b = self._manager("b", "machine_b")
+
+        a.sync_push("empty")
+        insert_item(a.db_path, "new_item", "v", 500.0)
+        a.sync_push("with data")
+
+        b.sync_pull()
+        self.assertIn("new_item", read_items(b.db_path))
+
+    def test_diagnostics_after_push_shows_no_collision(self):
+        pm = self._manager("a", "machine_a")
+        insert_item(pm.db_path, "x", "v", 100.0)
+        pm.sync_push("push")
+        diag = pm.machine_id_diagnostics()
+        self.assertFalse(diag["collision_risk"])
+        self.assertEqual(diag["local_latest_seq"], diag["manifest_latest_seq"])
 
 
 if __name__ == "__main__":

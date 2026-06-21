@@ -109,6 +109,59 @@ class PatchManager:
             raise ValueError("machine_id must contain only letters, digits, underscores, and hyphens")
         return machine_id
 
+    @classmethod
+    def validate_manifest(cls, manifest):
+        """Validate central manifest structure.  Raises ValueError if invalid.
+
+        Validation is strict: invalid manifests fail loudly with no silent
+        repair or fallback.  Any manifest written by this class passes.
+        """
+        import re
+
+        if not isinstance(manifest, dict):
+            raise ValueError(f"manifest must be a dict, got {type(manifest).__name__}")
+
+        for field in ("patch_schema_version", "remote_root", "machines", "updated_at"):
+            if field not in manifest:
+                raise ValueError(f"manifest missing required field: {field!r}")
+
+        if not isinstance(manifest["patch_schema_version"], int):
+            raise ValueError(
+                f"manifest.patch_schema_version must be int, "
+                f"got {type(manifest['patch_schema_version']).__name__}"
+            )
+
+        if not isinstance(manifest["remote_root"], str) or not manifest["remote_root"].strip():
+            raise ValueError(
+                f"manifest.remote_root must be a non-empty string, got {manifest['remote_root']!r}"
+            )
+
+        if not isinstance(manifest["machines"], dict):
+            raise ValueError(
+                f"manifest.machines must be a dict, got {type(manifest['machines']).__name__}"
+            )
+
+        for mid, entry in manifest["machines"].items():
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"machines[{mid!r}] must be a dict, got {type(entry).__name__}"
+                )
+            for entry_field in ("latest_seq", "updated_at"):
+                if entry_field not in entry:
+                    raise ValueError(
+                        f"machines[{mid!r}] missing required field: {entry_field!r}"
+                    )
+            seq = entry["latest_seq"]
+            if not isinstance(seq, str) or not re.match(r"^\d{6}$", seq):
+                raise ValueError(
+                    f"machines[{mid!r}].latest_seq must be a 6-digit string, got {seq!r}"
+                )
+            upd = entry["updated_at"]
+            if not isinstance(upd, (int, float)):
+                raise ValueError(
+                    f"machines[{mid!r}].updated_at must be numeric, got {type(upd).__name__}"
+                )
+
     def conn_open(self):
         import sqlite3
 
@@ -158,8 +211,14 @@ class PatchManager:
                 seq = self.local_patch_seq_next()
                 patch["seq"] = f"{seq:06d}"
 
-                patch_path = self.local_machine_dir / f"patch-{seq:06d}.json.gz"
+                # Hash covers all payload fields before patch_hash is added.
+                # Uses canonical JSON (sort_keys=True) for deterministic serialisation.
+                import hashlib
+                payload_no_hash = json.dumps(patch, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                patch["patch_hash"] = hashlib.sha256(payload_no_hash).hexdigest()
                 payload = json.dumps(patch, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+                patch_path = self.local_machine_dir / f"patch-{seq:06d}.json.gz"
                 with gzip.open(patch_path, "wb") as fh:
                     fh.write(payload)
 
@@ -182,12 +241,38 @@ class PatchManager:
     def patch_pack_apply(self, patch_path, source_machine_id=None, seq=None):
         """Apply one gzip JSON patch transactionally and idempotently."""
         import gzip
+        import hashlib
         import json
         import pathlib
 
         patch_path = pathlib.Path(patch_path)
-        with gzip.open(patch_path, "rb") as fh:
-            patch = json.loads(fh.read().decode("utf-8"))
+
+        # Decompress — return structured error instead of raising.
+        try:
+            with gzip.open(patch_path, "rb") as fh:
+                raw_bytes = fh.read()
+        except Exception as e:
+            return {"ok": False, "reason": "corrupt_gzip", "detail": str(e)}
+
+        # Parse JSON — return structured error instead of raising.
+        try:
+            patch = json.loads(raw_bytes.decode("utf-8"))
+        except Exception as e:
+            return {"ok": False, "reason": "corrupt_patch_json", "detail": str(e)}
+
+        # Validate integrity hash when present; skip silently for legacy patches.
+        stored_hash = patch.get("patch_hash")
+        if stored_hash is not None:
+            verify_dict = {k: v for k, v in patch.items() if k != "patch_hash"}
+            verify_bytes = json.dumps(verify_dict, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            computed = hashlib.sha256(verify_bytes).hexdigest()
+            if computed != stored_hash:
+                return {
+                    "ok": False,
+                    "reason": "invalid_patch_hash",
+                    "stored_hash": stored_hash,
+                    "computed_hash": computed,
+                }
 
         patch_machine = source_machine_id or patch.get("machine_id")
         patch_seq = seq or patch.get("seq")
@@ -262,7 +347,9 @@ class PatchManager:
 
         if not self.central_manifest_path.exists():
             return self.central_manifest_default()
-        return json.loads(self.central_manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(self.central_manifest_path.read_text(encoding="utf-8"))
+        self.validate_manifest(manifest)
+        return manifest
 
     def central_manifest_save_local(self, manifest):
         import json
@@ -413,6 +500,59 @@ class PatchManager:
         pulled = self.sync_pull()
         pushed = self.sync_push(description=description)
         return {"ok": bool(pulled.get("ok") and pushed.get("ok")), "pull": pulled, "push": pushed}
+
+    def machine_id_diagnostics(self):
+        """Return diagnostic information about this machine's ID and sync status.
+
+        Use collision_risk / collision_risk_reason to detect whether another
+        installation appears to be uploading patches under this machine_id:
+        if the central manifest claims a latest_seq higher than the highest
+        patch file present locally, someone else is writing as this machine.
+        """
+        import os
+
+        id_file = self.patch_dir / "machine_id.txt"
+
+        if id_file.exists():
+            source = "file"
+        elif os.environ.get("MACHINE_ID", "").strip():
+            source = "env"
+        else:
+            source = "generated"
+
+        local_patches = sorted(self.local_machine_dir.glob("patch-*.json.gz"))
+        local_latest_seq = (
+            local_patches[-1].name.split("-")[1].split(".")[0]
+            if local_patches
+            else "000000"
+        )
+
+        manifest_latest_seq = None
+        collision_risk = False
+        collision_risk_reason = None
+
+        if self.central_manifest_path.exists():
+            try:
+                manifest = self.central_manifest_load_local()
+                entry = manifest.get("machines", {}).get(self.machine_id)
+                if entry:
+                    manifest_latest_seq = entry.get("latest_seq")
+                    if manifest_latest_seq and int(manifest_latest_seq) > int(local_latest_seq):
+                        collision_risk = True
+                        collision_risk_reason = "manifest_seq_ahead_of_local"
+            except Exception:
+                pass
+
+        return {
+            "machine_id": self.machine_id,
+            "source": source,
+            "id_file_path": str(id_file),
+            "id_file_exists": id_file.exists(),
+            "local_latest_seq": local_latest_seq,
+            "manifest_latest_seq": manifest_latest_seq,
+            "collision_risk": collision_risk,
+            "collision_risk_reason": collision_risk_reason,
+        }
 
     @classmethod
     def time_now(cls):
